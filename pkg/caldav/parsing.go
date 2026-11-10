@@ -18,6 +18,7 @@ package caldav
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -219,6 +220,7 @@ func GetCaldavTodosForTasks(project *models.ProjectWithTasksAndBuckets, projectT
 			UID:         t.UID,
 			Summary:     t.Title,
 			Description: t.Description,
+			Done:        t.Done,
 			Completed:   t.DoneAt,
 			// Organizer:     &t.CreatedBy, // Disabled until we figure out how this works
 			Categories:  categories,
@@ -265,14 +267,35 @@ func getHexColorFromCaldavColor(caldavColor string) string {
 	return hexColor
 }
 
+// ParsedVTODOProperties reports which task fields the VTODO spoke to, so a partial
+// update overlays only those. True only when present *and* understood; an empty value
+// is an explicit clear. Labels, reminders and relations signal presence out of band.
+type ParsedVTODOProperties struct {
+	Title       bool
+	Description bool
+	Done        bool
+	Priority    bool
+	DueDate     bool
+	StartDate   bool
+	EndDate     bool
+	Color       bool
+}
+
+// ParseTaskFromVTODO parses a VTODO into a Task. Partial updates must overlay only
+// the fields reported by the returned properties, or everything else gets wiped.
+//
 //nolint:gocyclo
-func ParseTaskFromVTODO(content string) (vTask *models.Task, err error) {
+func ParseTaskFromVTODO(content string) (vTask *models.Task, props ParsedVTODOProperties, err error) {
+	if err = CheckVCalendarLimits(content); err != nil {
+		return nil, props, err
+	}
+
 	parsed, err := ics.ParseCalendar(strings.NewReader(content))
 	if err != nil {
-		return nil, err
+		return nil, props, err
 	}
 	if len(parsed.Components) == 0 {
-		return nil, errors.New("VTODO element does seem not contain any components")
+		return nil, props, errors.New("VTODO element does seem not contain any components")
 	}
 	var vTodo *ics.VTodo
 	for _, comp := range parsed.Components {
@@ -282,29 +305,38 @@ func ParseTaskFromVTODO(content string) (vTask *models.Task, err error) {
 		}
 	}
 	if vTodo == nil {
-		return nil, errors.New("VTODO element not found")
+		return nil, props, errors.New("VTODO element not found")
 	}
 	// We put the vTodo details in a map to be able to handle them more easily
 	task := make(map[string]ics.IANAProperty)
 
 	var relations []ics.IANAProperty
+	var categoryProps []ics.IANAProperty
 	var color string
+	var hasColor bool
 	for _, c := range vTodo.UnknownPropertiesIANAProperties() {
 		task[c.IANAToken] = c
 		if strings.HasPrefix(c.IANAToken, "RELATED-TO") {
 			relations = append(relations, c)
 		}
+		if c.IANAToken == "CATEGORIES" {
+			categoryProps = append(categoryProps, c)
+		}
 		if c.IANAToken == "X-APPLE-CALENDAR-COLOR" {
 			color = c.Value
+			hasColor = true
 		}
 		if c.IANAToken == "X-OUTLOOK-COLOR" {
 			color = c.Value
+			hasColor = true
 		}
 		if c.IANAToken == "X-FUNAMBOL-COLOR" {
 			color = c.Value
+			hasColor = true
 		}
 		if c.IANAToken == "COLOR" {
 			color = c.Value
+			hasColor = true
 		}
 	}
 
@@ -321,36 +353,46 @@ func ParseTaskFromVTODO(content string) (vTask *models.Task, err error) {
 
 	// Parse the priority
 	var priority int64
-	if _, ok := task["PRIORITY"]; ok {
+	_, hasPriority := task["PRIORITY"]
+	if hasPriority {
 		priorityParsed, err := strconv.ParseInt(task["PRIORITY"].Value, 10, 64)
 		if err != nil {
 			log.Errorf("[CALDAV] Failed to parse PRIORITY: %v", err)
-			return nil, err
+			return nil, props, err
 		}
 
 		priority = parseVTODOPriority(priorityParsed)
 	}
 
-	// Parse the enddate
-	var duration time.Duration
-	if durationProp, ok := task["DURATION"]; ok {
-		duration, _ = time.ParseDuration(durationProp.Value)
-	}
-
 	description := ""
-	if descProp, ok := task["DESCRIPTION"]; ok {
+	descProp, hasDescription := task["DESCRIPTION"]
+	if hasDescription {
 		description = strings.ReplaceAll(descProp.Value, "\\,", ",")
 		description = strings.ReplaceAll(description, "\\n", "\n")
 	}
 
 	var labels []*models.Label
-	if val, ok := task["CATEGORIES"]; ok {
-		categories := strings.Split(val.Value, ",")
-		labels = make([]*models.Label, 0, len(categories))
-		for _, category := range categories {
-			labels = append(labels, &models.Label{
-				Title: category,
-			})
+	if len(categoryProps) == 1 && strings.TrimSpace(categoryProps[0].Value) == "" {
+		labels = []*models.Label{}
+	} else if len(categoryProps) > 0 {
+		labels = make([]*models.Label, 0, len(categoryProps))
+		seen := make(map[string]struct{}, len(categoryProps))
+		for _, prop := range categoryProps {
+			value := strings.TrimSpace(prop.Value)
+			if value == "" {
+				continue
+			}
+			for _, category := range strings.Split(value, ",") {
+				category = strings.TrimSpace(category)
+				if category == "" {
+					continue
+				}
+				if _, ok := seen[category]; ok {
+					continue
+				}
+				seen[category] = struct{}{}
+				labels = append(labels, &models.Label{Title: category})
+			}
 		}
 	}
 
@@ -363,17 +405,42 @@ func ParseTaskFromVTODO(content string) (vTask *models.Task, err error) {
 		titleValue = summary.Value
 	}
 
+	dtStartProp, hasDTStart := task["DTSTART"]
+	startDate := caldavTimeToTimestamp(dtStartProp)
+
+	dueProp, hasDue := task["DUE"]
+	dueDate := caldavTimeToTimestamp(dueProp)
+
+	// time.ParseDuration can't read RFC 5545 durations like PT120H0M0S, hence ParseISO8601Duration.
+	dtEndProp, hasDTEnd := task["DTEND"]
+	_, hasDuration := task["DURATION"]
+	var endDate time.Time
+	var hasEndDate bool
+	switch {
+	case hasDTEnd:
+		endDate = caldavTimeToTimestamp(dtEndProp)
+		hasEndDate = parsedDateProperty(dtEndProp, hasDTEnd, endDate)
+	case hasDuration && hasDTStart && !startDate.IsZero():
+		if d := utils.ParseISO8601Duration(task["DURATION"].Value); d > 0 {
+			endDate = startDate.Add(d)
+			hasEndDate = true
+		}
+	}
+
+	hexColor := getHexColorFromCaldavColor(color)
+
 	vTask = &models.Task{
 		UID:         uidValue,
 		Title:       titleValue,
 		Description: description,
 		Priority:    priority,
 		Labels:      labels,
-		DueDate:     caldavTimeToTimestamp(task["DUE"]),
+		DueDate:     dueDate,
 		Updated:     caldavTimeToTimestamp(task["DTSTAMP"]),
-		StartDate:   caldavTimeToTimestamp(task["DTSTART"]),
+		StartDate:   startDate,
+		EndDate:     endDate,
 		DoneAt:      caldavTimeToTimestamp(task["COMPLETED"]),
-		HexColor:    getHexColorFromCaldavColor(color),
+		HexColor:    hexColor,
 	}
 
 	for _, c := range relations {
@@ -405,12 +472,15 @@ func ParseTaskFromVTODO(content string) (vTask *models.Task, err error) {
 		})
 	}
 
-	if status, ok := task["STATUS"]; ok && status.Value == "COMPLETED" {
+	_, hasStatus := task["STATUS"]
+	_, hasCompleted := task["COMPLETED"]
+
+	// RFC 5545: COMPLETED alone implies done; explicit STATUS always wins.
+	if hasCompleted {
 		vTask.Done = true
 	}
-
-	if duration > 0 && !vTask.StartDate.IsZero() {
-		vTask.EndDate = vTask.StartDate.Add(duration)
+	if status, ok := task["STATUS"]; ok {
+		vTask.Done = status.Value == "COMPLETED"
 	}
 
 	for _, vAlarm := range vTodo.SubComponents() {
@@ -419,7 +489,24 @@ func ParseTaskFromVTODO(content string) (vTask *models.Task, err error) {
 		}
 	}
 
-	return
+	props = ParsedVTODOProperties{
+		Title:       hasSummary,
+		Description: hasDescription,
+		Done:        hasStatus || hasCompleted,
+		Priority:    hasPriority,
+		DueDate:     parsedDateProperty(dueProp, hasDue, dueDate),
+		StartDate:   parsedDateProperty(dtStartProp, hasDTStart, startDate),
+		EndDate:     hasEndDate,
+		Color:       hasColor && (color == "" || hexColor != ""),
+	}
+
+	return vTask, props, nil
+}
+
+// parsedDateProperty tells an explicit clear (empty value) apart from a value
+// caldavTimeToTimestamp couldn't read - both yield the zero time.
+func parsedDateProperty(prop ics.IANAProperty, present bool, parsed time.Time) bool {
+	return present && (prop.Value == "" || !parsed.IsZero())
 }
 
 func parseVAlarm(vAlarm *ics.VAlarm, vTask *models.Task) *models.Task {
@@ -440,15 +527,14 @@ func parseVAlarm(vAlarm *ics.VAlarm, vTask *models.Task) *models.Task {
 
 		if contains(property.ICalParameters["RELATED"], "END") {
 			// Example: TRIGGER;RELATED=END:-P2D
-			if vTask.EndDate.IsZero() {
-				vTask.Reminders = append(vTask.Reminders, &models.TaskReminder{
-					RelativePeriod: int64(duration.Seconds()),
-					RelativeTo:     models.ReminderRelationDueDate})
-			} else {
-				vTask.Reminders = append(vTask.Reminders, &models.TaskReminder{
-					RelativePeriod: int64(duration.Seconds()),
-					RelativeTo:     models.ReminderRelationEndDate})
+			// We emit due- and end-relative reminders both as RELATED=END, so prefer due_date to keep ours round-tripping.
+			relativeTo := models.ReminderRelationEndDate
+			if !vTask.DueDate.IsZero() || vTask.EndDate.IsZero() {
+				relativeTo = models.ReminderRelationDueDate
 			}
+			vTask.Reminders = append(vTask.Reminders, &models.TaskReminder{
+				RelativePeriod: int64(duration.Seconds()),
+				RelativeTo:     relativeTo})
 			continue
 		}
 
@@ -478,9 +564,13 @@ func caldavTimeToTimestamp(ianaProperty ics.IANAProperty) time.Time {
 	}
 
 	format := DateFormat
+	loc := config.GetTimeZone()
 
-	if strings.HasSuffix(tstring, "Z") {
+	// A trailing Z is UTC per RFC 5545 and cannot be combined with a TZID.
+	isUTC := strings.HasSuffix(tstring, "Z")
+	if isUTC {
 		format = `20060102T150405Z`
+		loc = time.UTC
 	}
 
 	if len(tstring) == 8 {
@@ -490,15 +580,15 @@ func caldavTimeToTimestamp(ianaProperty ics.IANAProperty) time.Time {
 	var t time.Time
 	var err error
 	tzParameter := ianaProperty.ICalParameters["TZID"]
-	if len(tzParameter) > 0 {
-		loc, locErr := time.LoadLocation(tzParameter[0])
+	if len(tzParameter) > 0 && !isUTC {
+		tzLoc, locErr := time.LoadLocation(tzParameter[0])
 		if locErr != nil {
 			log.Warningf("Error while parsing caldav timezone %s: %s", tzParameter[0], locErr)
 		} else {
-			t, err = time.ParseInLocation(format, tstring, loc)
+			t, err = time.ParseInLocation(format, tstring, tzLoc)
 		}
 	} else {
-		t, err = time.ParseInLocation(format, tstring, config.GetTimeZone())
+		t, err = time.ParseInLocation(format, tstring, loc)
 	}
 
 	if err != nil {
@@ -507,4 +597,105 @@ func caldavTimeToTimestamp(ianaProperty ics.IANAProperty) time.Time {
 	}
 
 	return t.In(config.GetTimeZone())
+}
+
+const (
+	MaxVCalendarSize = 1 << 20
+	// golang-ical rescans the whole line for every parameter value.
+	MaxPropertyParameters = 100
+)
+
+var (
+	ErrVCalendarTooLarge         = fmt.Errorf("calendar data must not exceed %d bytes", MaxVCalendarSize)
+	ErrTooManyPropertyParameters = fmt.Errorf("a calendar property must not have more than %d parameters", MaxPropertyParameters)
+)
+
+var icalUnfolder = strings.NewReplacer("\r\n ", "", "\r\n\t", "", "\n ", "", "\n\t", "")
+
+// CheckVCalendarLimits is linear itself, so it is safe to run before any permission check.
+func CheckVCalendarLimits(content string) error {
+	if len(content) > MaxVCalendarSize {
+		return ErrVCalendarTooLarge
+	}
+
+	for line := range strings.SplitSeq(icalUnfolder.Replace(content), "\n") {
+		if strings.Count(line, ";")+strings.Count(line, ",") <= MaxPropertyParameters {
+			continue
+		}
+		count, ok := propertyParameterCount(line)
+		if !ok || count > MaxPropertyParameters {
+			return ErrTooManyPropertyParameters
+		}
+	}
+
+	return nil
+}
+
+func isICalTokenChar(b byte) bool {
+	return b == '-' || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9')
+}
+
+func skipICalToken(line string, i int) int {
+	for i < len(line) && isICalTokenChar(line[i]) {
+		i++
+	}
+	return i
+}
+
+// propertyParameterCount mirrors golang-ical's line walk; ok is false where the parser is more lenient.
+func propertyParameterCount(line string) (count int, ok bool) {
+	i := skipICalToken(line, 0)
+	if i == 0 {
+		return 0, false
+	}
+
+	for i < len(line) {
+		switch line[i] {
+		case ':':
+			return count, true
+		case ';':
+			nameEnd := skipICalToken(line, i+1)
+			if nameEnd == i+1 || nameEnd >= len(line) || line[nameEnd] != '=' {
+				return count, false
+			}
+			i = nameEnd
+			for {
+				count++
+				i, ok = skipParameterValue(line, i+1)
+				if !ok {
+					return count, false
+				}
+				if i >= len(line) || line[i] != ',' {
+					break
+				}
+			}
+		default:
+			return count, false
+		}
+	}
+
+	return count, false
+}
+
+func skipParameterValue(line string, i int) (int, bool) {
+	quoted := i < len(line) && line[i] == '"'
+	if quoted {
+		i++
+	}
+	for ; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			i++
+		case '"':
+			if quoted {
+				return i + 1, true
+			}
+			return i, false
+		case ';', ':', ',':
+			if !quoted {
+				return i, true
+			}
+		}
+	}
+	return i, false
 }

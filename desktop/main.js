@@ -15,6 +15,7 @@ const {execFile} = require('child_process')
 const express = require('express')
 const portInUse = require('./portInUse.js')
 const oauth = require('./oauth.js')
+const {CONTENT_SECURITY_POLICY} = require('./csp.js')
 
 const frontendPath = 'frontend/'
 const PROTOCOL = 'vikunja-desktop'
@@ -74,9 +75,9 @@ if (!gotTheLock) {
 // scheme on the host — write a handler-only desktop file and register it via xdg-mime ourselves.
 function registerAppImageProtocolHandler() {
 	const appImagePath = process.env.APPIMAGE
-	// A newline in the path would break out of the quoted Exec= line and inject
-	// extra desktop-entry keys, so refuse to register such a path.
-	if (process.platform !== 'linux' || !appImagePath || /[\n\r]/.test(appImagePath)) {
+	// Newlines would inject extra desktop-entry keys. Backslashes go through two
+	// unescaping layers (string value, then Exec quoting), so refuse both.
+	if (process.platform !== 'linux' || !appImagePath || /[\n\r\\]/.test(appImagePath)) {
 		return
 	}
 
@@ -228,8 +229,17 @@ function startServer(callback) {
 			port = 0
 		}
 
-		eApp.use(express.static(path.join(__dirname, frontendPath)))
+		// Documents only: sw.js importScripts() the workbox runtime, and a service worker
+		// inherits the CSP of its own script response rather than the page's.
+		eApp.use(express.static(path.join(__dirname, frontendPath), {
+			setHeaders: (response, filePath) => {
+				if (filePath.endsWith('index.html')) {
+					response.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY)
+				}
+			},
+		}))
 		eApp.use((request, response) => {
+			response.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY)
 			response.sendFile(path.join(__dirname, frontendPath, 'index.html'))
 		})
 
@@ -575,7 +585,6 @@ app.whenReady().then(() => {
 
 	startServer(() => {
 		createMainWindow()
-		createQuickEntryWindow()
 		setupTray()
 
 		registerQuickEntryShortcut(DEFAULT_QUICK_ENTRY_SHORTCUT)

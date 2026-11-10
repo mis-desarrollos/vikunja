@@ -25,12 +25,10 @@ import (
 	"time"
 
 	"code.vikunja.io/api/pkg/config"
-	"code.vikunja.io/api/pkg/db"
 
 	"github.com/ganigeorgiev/fexpr"
 	"github.com/iancoleman/strcase"
 	"github.com/jszwedko/go-datemath"
-	"xorm.io/builder"
 	"xorm.io/xorm/schemas"
 )
 
@@ -60,17 +58,21 @@ type taskFilter struct {
 	comparator taskFilterComparator
 	isNumeric  bool
 	join       taskFilterConcatinator
+	// Only set on nested groups: include nulls for this group even if the rest of the filter doesn't.
+	includeNulls bool
 }
 
-// adjustDateForMysql adjusts dates with year < 1 to be compatible with MySQL/MariaDB.
-// MySQL does not support dates where year < 1. We set the year to 1 and add an extra day
-// if the date is January 1st to survive xorm's timezone conversion to GMT.
-func adjustDateForMysql(t time.Time) time.Time {
-	if db.GetDialect() != builder.MYSQL || t.Year() >= 1 {
+// clampDateToDriverRange lifts boundaries with year < 1 back into year 1:
+// converting the zero-date sentinel to UTC from a timezone east of Greenwich
+// underflows into year 0, which the MySQL driver refuses to encode ("year is
+// not in the range [1, 9999]"). The extra day for January 1st keeps the
+// boundary strictly after the sentinel, so `due_date > 0001-01-01` keeps
+// meaning "has a due date".
+func clampDateToDriverRange(t time.Time) time.Time {
+	if t.Year() >= 1 {
 		return t
 	}
 	t = t.AddDate(1-t.Year(), 0, 0)
-	// Add extra day to survive timezone conversion to GMT (only needed for Jan 1st)
 	if t.Month() == 1 && t.Day() == 1 {
 		t = t.AddDate(0, 0, 1)
 	}
@@ -110,11 +112,11 @@ func parseTimeFromUserInput(timeString string, loc *time.Location) (value time.T
 	}
 	// UTC, not service timezone — see getValueForField.
 	value = value.UTC()
-	value = adjustDateForMysql(value)
+	value = clampDateToDriverRange(value)
 	return value, err
 }
 
-func parseFilterFromExpression(f fexpr.ExprGroup, loc *time.Location) (filter *taskFilter, err error) {
+func parseFilterFromExpression(f fexpr.ExprGroup, loc *time.Location, budget *businessDayBudget) (filter *taskFilter, err error) {
 	filter = &taskFilter{
 		join: filterConcatAnd,
 	}
@@ -134,7 +136,7 @@ func parseFilterFromExpression(f fexpr.ExprGroup, loc *time.Location) (filter *t
 	case []fexpr.ExprGroup:
 		values := make([]*taskFilter, 0, len(v))
 		for _, expression := range v {
-			subfilter, err := parseFilterFromExpression(expression, loc)
+			subfilter, err := parseFilterFromExpression(expression, loc, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -160,7 +162,7 @@ func parseFilterFromExpression(f fexpr.ExprGroup, loc *time.Location) (filter *t
 		return nil, err
 	}
 
-	reflectValue, filter.value, err = getNativeValueForTaskField(filter.field, filter.comparator, value, loc)
+	reflectValue, filter.value, err = getNativeValueForTaskField(filter.field, filter.comparator, value, loc, budget)
 	if err != nil {
 		return nil, ErrInvalidTaskFilterValue{
 			Field: filter.field,
@@ -174,13 +176,74 @@ func parseFilterFromExpression(f fexpr.ExprGroup, loc *time.Location) (filter *t
 	return filter, nil
 }
 
+// filterOperatorSigils maps the human filter operators to their fexpr sigil.
+// Order matters: " not in " must be matched before " in " so the longer
+// operator wins.
+var filterOperatorSigils = []struct {
+	operator string
+	sigil    string
+}{
+	{" not in ", " " + string(fexpr.SignAnyNeq) + " "},
+	{" in ", " " + string(fexpr.SignAnyEq) + " "},
+	{" like ", " " + string(fexpr.SignLike) + " "},
+}
+
+// quotedRunEnd returns the index just past the quoted string opening at start,
+// or -1 if it is never closed. Quoting mirrors fexpr's scanner: both ' and "
+// quote, and a backslash escapes whatever follows it.
+func quotedRunEnd(filter string, start int) int {
+	quote := filter[start]
+	for i := start + 1; i < len(filter); i++ {
+		switch filter[i] {
+		case '\\':
+			i++
+		case quote:
+			return i + 1
+		}
+	}
+	return -1
+}
+
+// replaceFilterOperators rewrites the human filter operators to fexpr sigils,
+// skipping quoted values so `title like 'stuff in progress'` keeps its text.
+// An unclosed quote is treated as an ordinary character, because bare values
+// may legitimately contain an apostrophe (`title = it's cool && done = false`).
+func replaceFilterOperators(filter string) string {
+	var out strings.Builder
+	out.Grow(len(filter))
+
+	for i := 0; i < len(filter); {
+		if c := filter[i]; c == '\'' || c == '"' {
+			if end := quotedRunEnd(filter, i); end > 0 {
+				out.WriteString(filter[i:end])
+				i = end
+				continue
+			}
+		}
+
+		matched := false
+		for _, op := range filterOperatorSigils {
+			if strings.HasPrefix(filter[i:], op.operator) {
+				out.WriteString(op.sigil)
+				i += len(op.operator)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out.WriteByte(filter[i])
+			i++
+		}
+	}
+
+	return out.String()
+}
+
 // preprocessFilterString rewrites the human filter syntax (in / not in / like)
 // into fexpr sigils and quotes bare values so fexpr.Parse accepts them. Shared
 // by every entity that filters with the task grammar.
 func preprocessFilterString(filter string) string {
-	filter = strings.ReplaceAll(filter, " not in ", " "+string(fexpr.SignAnyNeq)+" ")
-	filter = strings.ReplaceAll(filter, " in ", " ?= ")
-	filter = strings.ReplaceAll(filter, " like ", " ~ ")
+	filter = replaceFilterOperators(filter)
 
 	re := regexp.MustCompile(`(\w+)\s*(>=|<=|!=|~|\?=|\?!=|=|>|<)\s*([^&|()]+)`)
 	return re.ReplaceAllStringFunc(filter, func(match string) string {
@@ -204,13 +267,65 @@ func preprocessFilterString(filter string) string {
 	})
 }
 
+// These caps block GHSA-xxc3-xpmc-vmvr before fexpr allocates while leaving
+// realistic hand-written filters unaffected.
+const (
+	maxFilterBytes = 16 * 1024
+	maxFilterDepth = 100
+)
+
+func validateFilterComplexity(filter string) error {
+	if len(filter) > maxFilterBytes {
+		return &ErrFilterTooComplex{Reason: fmt.Sprintf("it exceeds the %d-byte limit", maxFilterBytes)}
+	}
+
+	return nil
+}
+
+// Uses fexpr's own scanner so comments and quotes are read exactly as Parse reads them.
+func filterGroupDepthExceeds(filter string, remaining int) bool {
+	scanner := fexpr.NewScanner([]byte(filter))
+	for {
+		t, err := scanner.Scan()
+		if err != nil || t.Type == fexpr.TokenEOF {
+			return false
+		}
+		if t.Type != fexpr.TokenGroup {
+			continue
+		}
+		if remaining == 0 || filterGroupDepthExceeds(t.Literal, remaining-1) {
+			return true
+		}
+	}
+}
+
+func prepareFilterForParsing(filter string) (string, error) {
+	// Preprocessing may shrink or expand input, so enforce the cap on both forms.
+	if err := validateFilterComplexity(filter); err != nil {
+		return "", err
+	}
+
+	filter = preprocessFilterString(filter)
+	if err := validateFilterComplexity(filter); err != nil {
+		return "", err
+	}
+	if filterGroupDepthExceeds(filter, maxFilterDepth) {
+		return "", &ErrFilterTooComplex{Reason: fmt.Sprintf("it exceeds the %d-level nesting limit", maxFilterDepth)}
+	}
+
+	return filter, nil
+}
+
 func getTaskFiltersFromFilterString(filter string, filterTimezone string) (filters []*taskFilter, err error) {
 
 	if filter == "" {
 		return
 	}
 
-	filter = preprocessFilterString(filter)
+	filter, err = prepareFilterForParsing(filter)
+	if err != nil {
+		return nil, err
+	}
 
 	parsedFilter, err := fexpr.Parse(filter)
 	if err != nil {
@@ -231,9 +346,10 @@ func getTaskFiltersFromFilterString(filter string, filterTimezone string) (filte
 		}
 	}
 
+	var budget businessDayBudget
 	filters = make([]*taskFilter, 0, len(parsedFilter))
 	for _, f := range parsedFilter {
-		parsedFilter, err := parseFilterFromExpression(f, loc)
+		parsedFilter, err := parseFilterFromExpression(f, loc, &budget)
 		if err != nil {
 			return nil, err
 		}
@@ -241,6 +357,16 @@ func getTaskFiltersFromFilterString(filter string, filterTimezone string) (filte
 	}
 
 	return
+}
+
+func isErrInvalidFilter(err error) bool {
+	return IsErrInvalidFilterExpression(err) ||
+		IsErrFilterTooComplex(err) ||
+		IsErrInvalidTaskFilterValue(err) ||
+		IsErrInvalidTaskFilterConcatinator(err) ||
+		IsErrInvalidTaskFilterComparator(err) ||
+		IsErrInvalidTaskField(err) ||
+		IsErrInvalidTimezone(err)
 }
 
 func validateTaskFieldComparator(comparator taskFilterComparator) error {
@@ -292,6 +418,31 @@ func getFilterComparatorFromOp(op fexpr.SignOp) (taskFilterComparator, error) {
 	}
 }
 
+// MaxDatemathBusinessDays caps the summed "b" offsets of a filter's date values; go-datemath adds them one day at a time.
+const MaxDatemathBusinessDays = 10000
+
+var datemathBusinessDayOffset = regexp.MustCompile(`[+-](\d*)b`)
+
+type businessDayBudget int
+
+func (b *businessDayBudget) spend(value string) error {
+	for _, match := range datemathBusinessDayOffset.FindAllStringSubmatch(value, -1) {
+		days := 1
+		if match[1] != "" {
+			var err error
+			days, err = strconv.Atoi(match[1])
+			if err != nil {
+				days = MaxDatemathBusinessDays + 1
+			}
+		}
+		if days > MaxDatemathBusinessDays-int(*b) {
+			return fmt.Errorf("business day offsets exceed %d days", MaxDatemathBusinessDays)
+		}
+		*b += businessDayBudget(days)
+	}
+	return nil
+}
+
 // safeDatemathParse wraps datemath.Parse with a recover to catch panics from
 // the datemath lexer when given malformed input (e.g. "no" triggers a
 // "scanner internal error" panic in the generated lexer).
@@ -304,7 +455,7 @@ func safeDatemathParse(s string) (expr datemath.Expression, err error) {
 	return datemath.Parse(s)
 }
 
-func getValueForField(field reflect.StructField, rawValue string, loc *time.Location) (value interface{}, err error) {
+func getValueForField(field reflect.StructField, rawValue string, loc *time.Location, budget *businessDayBudget) (value interface{}, err error) {
 
 	if loc == nil {
 		loc = config.GetTimeZone()
@@ -323,6 +474,9 @@ func getValueForField(field reflect.StructField, rawValue string, loc *time.Loca
 		value, err = strconv.ParseBool(rawValue)
 	case reflect.Struct:
 		if field.Type == schemas.TimeType {
+			if err = budget.spend(rawValue); err != nil {
+				return
+			}
 			var t datemath.Expression
 			var tt time.Time
 			t, err = safeDatemathParse(rawValue)
@@ -331,7 +485,7 @@ func getValueForField(field reflect.StructField, rawValue string, loc *time.Loca
 				// the driver drops a bound parameter's offset, so a non-UTC wall clock
 				// shifts the boundary. loc still controls how the datemath rounds.
 				tt = t.Time(datemath.WithLocation(loc)).UTC()
-				tt = adjustDateForMysql(tt)
+				tt = clampDateToDriverRange(tt)
 			} else {
 				tt, err = parseTimeFromUserInput(rawValue, loc)
 			}
@@ -363,13 +517,20 @@ func getValueForField(field reflect.StructField, rawValue string, loc *time.Loca
 	return
 }
 
-func getNativeValueForTaskField(fieldName string, comparator taskFilterComparator, value string, loc *time.Location) (reflectField *reflect.StructField, nativeValue interface{}, err error) {
+func getNativeValueForTaskField(fieldName string, comparator taskFilterComparator, value string, loc *time.Location, budget *businessDayBudget) (reflectField *reflect.StructField, nativeValue interface{}, err error) {
 
 	realFieldName := strings.ReplaceAll(strcase.ToCamel(fieldName), "Id", "ID")
 
-	if realFieldName == "Assignees" {
+	if realFieldName == "Assignees" || realFieldName == "CreatedBy" {
 		vals := strings.Split(value, ",")
-		valueSlice := append([]string{}, vals...)
+		valueSlice := make([]string, 0, len(vals))
+		for _, val := range vals {
+			val = strings.TrimSpace(val)
+			if val == "" {
+				continue
+			}
+			valueSlice = append(valueSlice, val)
+		}
 		return nil, valueSlice, nil
 	}
 
@@ -389,7 +550,7 @@ func getNativeValueForTaskField(fieldName string, comparator taskFilterComparato
 		vals := strings.Split(value, ",")
 		valueSlice := []interface{}{}
 		for _, val := range vals {
-			v, err := getValueForField(field, val, loc)
+			v, err := getValueForField(field, val, loc, budget)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -398,6 +559,6 @@ func getNativeValueForTaskField(fieldName string, comparator taskFilterComparato
 		return nil, valueSlice, nil
 	}
 
-	val, err := getValueForField(field, value, loc)
+	val, err := getValueForField(field, value, loc, budget)
 	return &field, val, err
 }

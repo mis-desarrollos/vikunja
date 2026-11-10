@@ -21,6 +21,7 @@ import (
 	"net/http"
 
 	"code.vikunja.io/api/pkg/health"
+	"code.vikunja.io/api/pkg/log"
 	"code.vikunja.io/api/pkg/modules/auth/openid"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -38,12 +39,12 @@ func RegisterHealthRoutes(api huma.API) {
 	Register(api, huma.Operation{
 		OperationID: "health",
 		Summary:     "Healthcheck",
-		Description: "Reports whether the service and its dependencies (database, Redis if enabled) are reachable. Returns 200 with status \"OK\" when healthy, 500 otherwise. When OpenID Connect providers are configured, each provider's availability is reported too; an unavailable provider (typically because it was unreachable while Vikunja started) degrades the status but never fails the check, since initialization is retried automatically (with exponential backoff, after at most 15 minutes) and a restart would not help. Public — no authentication required.",
+		Description: "Reports whether the service and its dependencies (database, Redis if enabled) are reachable. Returns 200 with status \"OK\" when healthy, 500 otherwise. When OpenID Connect providers are configured, each provider's availability is reported too; an unavailable provider (typically because it was unreachable while Vikunja started) degrades the status but never fails the check, since initialization is retried automatically (with exponential backoff, after at most 15 minutes) and a restart would not help. Public unless `health.username` and `health.password` are configured, in which case it requires HTTP Basic auth with those credentials.",
 		Method:      http.MethodGet,
 		Path:        "/health",
 		Tags:        []string{"service"},
-		// Public: opt out of the globally-applied auth. The path is also listed
-		// in unauthenticatedAPIPaths so the token middleware lets it through.
+		// Opt out of the globally-applied JWT auth. The path is also listed in
+		// unauthenticatedAPIPaths; optional basic auth is applied in routes.go.
 		Security: []map[string][]string{},
 	}, healthcheck)
 }
@@ -53,9 +54,8 @@ func init() { AddRouteRegistrar(RegisterHealthRoutes) }
 //nolint:contextcheck // health.Check and openid.GetAllProviders are shared v1/v2 code; they take no context and use background contexts for their own pings.
 func healthcheck(_ context.Context, _ *struct{}) (*healthBody, error) {
 	if err := health.Check(); err != nil {
-		// Mirror v1: a failed check is an internal error; the cause is logged,
-		// not leaked to the client.
-		return nil, huma.Error500InternalServerError("Internal server error", err)
+		log.Errorf("v2: healthcheck failed: %s", err)
+		return nil, huma.Error500InternalServerError("Internal server error")
 	}
 	out := &healthBody{}
 	out.Body.Status = "OK"
